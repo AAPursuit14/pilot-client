@@ -2,6 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { FaCheckCircle, FaUsers, FaUserAlt, FaBook, FaArrowRight, FaCalendarAlt, FaExclamationTriangle } from 'react-icons/fa';
 import { useAuth } from '../../context/AuthContext';
+import { fetchTodayAttendance, triggerPhotoCleanup, shouldRunDailyCleanup, markDailyCleanupRun } from '../../services/attendanceService';
+import { calculateLateArrivalMinutes, getAttendanceStatus, groupAttendanceByCohort, summarizeAttendance } from '../../utils/attendanceUtils';
 
 import './Dashboard.css';
 
@@ -18,16 +20,34 @@ function Dashboard() {
   const [dailyTasks, setDailyTasks] = useState([]);
   const [objectives, setObjectives] = useState([]);
   const [cohortFilter, setCohortFilter] = useState(null);
+  const [attendanceLoading, setAttendanceLoading] = useState(false);
+  const [attendanceMembers, setAttendanceMembers] = useState([]);
+  const [attendanceCohorts, setAttendanceCohorts] = useState([]);
+  const [scheduledStart, setScheduledStart] = useState(null);
+  const [cleanupRunning, setCleanupRunning] = useState(false);
 
   useEffect(() => {
     // Only fetch dashboard data if user is active
     if (isActive) {
       fetchDashboardData();
+      fetchAttendanceData();
     } else {
       // If user is inactive, we don't need to load the dashboard data
       setIsLoading(false);
     }
   }, [token, cohortFilter, user.role, isActive]);
+
+  useEffect(() => {
+    // Admin/staff: run photo cleanup once per 24h in background
+    if (!isActive) return;
+    if (user?.role === 'admin' || user?.role === 'staff') {
+      if (shouldRunDailyCleanup()) {
+        triggerPhotoCleanup(token, { keepFirst: true, maxAgeHours: 24 })
+          .then(() => markDailyCleanupRun())
+          .catch((e) => console.error('Photo cleanup failed:', e));
+      }
+    }
+  }, [token, user?.role, isActive]);
 
   const fetchDashboardData = async () => {
     try {
@@ -71,6 +91,14 @@ function Dashboard() {
       // Process the data
       const timeBlocks = data.timeBlocks || [];
       const taskProgress = Array.isArray(data.taskProgress) ? data.taskProgress : [];
+
+      // Determine scheduled start time (earliest block)
+      if (Array.isArray(timeBlocks) && timeBlocks.length > 0) {
+        const earliest = [...timeBlocks].sort((a, b) => String(a.start_time).localeCompare(String(b.start_time)))[0];
+        setScheduledStart(earliest?.start_time || null);
+      } else {
+        setScheduledStart(null);
+      }
       
       // Extract tasks from all time blocks
       const allTasks = [];
@@ -108,6 +136,46 @@ function Dashboard() {
       console.log('Error details:', error.message);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const runCleanupNow = async () => {
+    try {
+      setCleanupRunning(true);
+      await triggerPhotoCleanup(token, { keepFirst: true, maxAgeHours: 24 });
+      markDailyCleanupRun();
+    } catch (e) {
+      console.error('Manual photo cleanup failed:', e);
+    } finally {
+      setCleanupRunning(false);
+    }
+  };
+
+  const fetchAttendanceData = async () => {
+    try {
+      setAttendanceLoading(true);
+      const isStaffView = (user.role === 'staff' || user.role === 'admin');
+      const cohortParam = isStaffView && cohortFilter ? cohortFilter : null;
+      const data = await fetchTodayAttendance(token, cohortParam);
+      const members = Array.isArray(data?.members) ? data.members : [];
+
+      // Use scheduledStart from API if present; otherwise fall back to derived value
+      const scheduled = data?.scheduledStart || scheduledStart;
+      const nowRef = new Date();
+      const enriched = members.map((m) => {
+        const lateMinutes = calculateLateArrivalMinutes(scheduled, m?.checkInTime, nowRef);
+        const status = getAttendanceStatus(lateMinutes);
+        return { ...m, lateMinutes, status };
+      });
+      setAttendanceMembers(enriched);
+      const cohorts = groupAttendanceByCohort(enriched, scheduled || '09:00', 5, nowRef);
+      setAttendanceCohorts(cohorts);
+    } catch (e) {
+      console.error('Failed to load attendance data:', e);
+      setAttendanceMembers([]);
+      setAttendanceCohorts([]);
+    } finally {
+      setAttendanceLoading(false);
     }
   };
 
@@ -236,6 +304,69 @@ function Dashboard() {
           
           {/* Right panel - Daily Schedule */}
           <div className="dashboard__schedule-panel">
+            <div className="attendance-panel">
+              <div className="attendance-panel__header">
+                <h2 className="panel-title">Today's Attendance</h2>
+                <div className="attendance-panel__actions">
+                  {attendanceLoading && <span className="attendance-loading">Loading...</span>}
+                  {(user.role === 'admin' || user.role === 'staff') && (
+                    <button className="cleanup-btn" onClick={runCleanupNow} disabled={cleanupRunning}>
+                      {cleanupRunning ? 'Cleaning…' : 'Run Cleanup'}
+                    </button>
+                  )}
+                </div>
+              </div>
+              {attendanceMembers.length > 0 ? (
+                <div className="attendance-summary">
+                  {(() => {
+                    const summary = summarizeAttendance(attendanceMembers, scheduledStart || '09:00', 5, new Date());
+                    return (
+                      <>
+                        <div className="attendance-summary__totals">
+                          <span className="attendance-total">Present {summary.present}/{summary.total}</span>
+                        </div>
+                        <div className="attendance-summary__badges">
+                          <span className={`attendance-badge on-time`}>
+                            On Time {summary.onTime}
+                          </span>
+                          <span className={`attendance-badge late`}>
+                            Late {summary.late}
+                          </span>
+                        </div>
+                      </>
+                    );
+                  })()}
+                </div>
+              ) : (
+                <p className="no-content-message">No attendance yet.</p>
+              )}
+
+              {attendanceCohorts.length > 0 && (
+                <div className="cohort-analytics">
+                  {attendanceCohorts.map((c) => {
+                    const total = c.present || 0;
+                    const onTimePct = total > 0 ? Math.round((c.onTime / total) * 100) : 0;
+                    const latePct = total > 0 ? Math.max(0, 100 - onTimePct) : 0;
+                    return (
+                      <div key={c.name} className="cohort-row">
+                        <div className="cohort-row__header">
+                          <div className="cohort-row__title">{c.name}</div>
+                          <div className="cohort-row__counts">
+                            <span className="cohort-count on-time">On Time {c.onTime}</span>
+                            <span className="cohort-count late">Late {c.late}</span>
+                          </div>
+                        </div>
+                        <div className="cohort-bar">
+                          <div className="cohort-bar__on-time" style={{ width: `${onTimePct}%` }} />
+                          <div className="cohort-bar__late" style={{ width: `${latePct}%` }} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
             <h2 className="panel-title">Daily Schedule Panel</h2>
             {dailyTasks.length > 0 ? (
               <div className="schedule-list">
